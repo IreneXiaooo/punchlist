@@ -1,0 +1,94 @@
+{
+  "version": "0.2",
+  "task": {
+    "id": "t-0001-duration-validation",
+    "goal": "parse_duration() in src/app/util.py accepts strings like '90s', '5m', '2h' and returns seconds. It currently crashes with a confusing error on bad input ('', '5x', '-3m', '1.5h'). Make it raise ValueError with a clear message for invalid input, keep every valid input returning exactly what it returns today, and cover the new behaviour with tests.",
+    "repo": ".",
+    "created_at": "2026-10-04T09:00:00Z",
+    "planner": { "runtime": "claude-code", "effort": "high" },
+    "acceptance_policy": { "human_review": "optional" }
+  },
+  "budget": {
+    "limits": [
+      { "unit": "quota_fraction", "lane": "expensive", "max": 0.05, "reserve": 0.01 },
+      { "unit": "usd", "max": 2.0 }
+    ],
+    "on_unknown_cost": "halt"
+  },
+  "steps": [
+    {
+      "id": "s1",
+      "title": "Scout parse_duration and its call sites",
+      "instruction": "Locate the definition of parse_duration and every call site in the repository. Write a context bundle to .punchlist/t-0001-duration-validation/bundles/s1.md with three sections: (1) the full source of parse_duration with its path and line numbers, (2) every call site as path:line followed by the enclosing line of code, (3) names and paths of existing tests that mention parse_duration. Do not modify any file outside the bundle path.",
+      "scope": { "allow": [".punchlist/t-0001-duration-validation/bundles/**"], "max_changed_files": 1 },
+      "acceptance": [
+        {
+          "id": "bundle-written",
+          "kind": "command",
+          "run": "test -s .punchlist/t-0001-duration-validation/bundles/s1.md && rg -q 'def parse_duration' .punchlist/t-0001-duration-validation/bundles/s1.md"
+        }
+      ],
+      "lanes": ["cheap"],
+      "escalation": { "policy": "ladder", "within_lane": ["retry"], "max_retries_per_lane": 1, "after_last_lane": "human" },
+      "report": { "max_summary_chars": 300, "evidence": ["changed_files", "snippets"] },
+      "estimate": { "usd": 0.02, "minutes": 2 },
+      "worker_limits": { "max_tool_calls": 15, "timeout_s": 300, "allow_continuation": false }
+    },
+    {
+      "id": "s2",
+      "title": "Reject invalid input in parse_duration",
+      "depends_on": ["s1"],
+      "context": {
+        "bundle": ".punchlist/t-0001-duration-validation/bundles/s1.md",
+        "notes": [
+          "The project uses ruff with the default rule set.",
+          "Error messages in this codebase are lowercase and start with the noun, e.g. 'invalid duration: ...'."
+        ]
+      },
+      "instruction": "Edit only parse_duration in src/app/util.py, as shown in the bundle. Raise ValueError(f\"invalid duration: {value!r}\") when the input is invalid. Invalid means any of: empty string, no unit suffix, unit not one of s/m/h, number part negative or not a plain integer. For every valid input the return value must be exactly what it is today. Do not change the function signature, do not touch call sites, do not add dependencies. Do not create or edit tests/test_duration_validation.py; the acceptance check owns that file.",
+      "scope": { "allow": ["src/app/util.py"], "deny": ["tests/**"], "max_changed_files": 1, "max_diff_lines": 60 },
+      "constraints": ["No new dependencies", "Public signature unchanged", "No changes outside parse_duration"],
+      "acceptance": [
+        {
+          "id": "new-tests",
+          "kind": "test",
+          "covers": ["raise ValueError with a clear message for invalid input", "keep every valid input returning exactly what it returns today"],
+          "run": "pytest tests/test_duration_validation.py -q --tb=short",
+          "write_files": [
+            {
+              "path": "tests/test_duration_validation.py",
+              "content": "import pytest\nfrom app.util import parse_duration\n\n\n@pytest.mark.parametrize(\"bad\", [\"\", \"5x\", \"-3m\", \"m\", \"1.5h\", \"90\"])\ndef test_rejects_invalid(bad):\n    with pytest.raises(ValueError, match=\"invalid duration\"):\n        parse_duration(bad)\n\n\n@pytest.mark.parametrize(\"good,seconds\", [(\"90s\", 90), (\"5m\", 300), (\"2h\", 7200), (\"0s\", 0)])\ndef test_keeps_valid(good, seconds):\n    assert parse_duration(good) == seconds\n"
+            }
+          ]
+        },
+        { "id": "existing-tests", "kind": "test", "covers": ["keep every valid input returning exactly what it returns today"], "run": "pytest -q -x --tb=short", "timeout_s": 600 },
+        { "id": "lint", "kind": "lint", "run": "ruff check src/" }
+      ],
+      "lanes": ["cheap", "expensive"],
+      "escalation": { "policy": "ladder", "within_lane": ["retry", "rewrite_instruction"], "max_retries_per_lane": 1, "max_rewrites_per_lane": 1, "after_last_lane": "human" },
+      "max_attempts": 6,
+      "decision_point": false,
+      "report": { "max_summary_chars": 600, "evidence": ["changed_files", "test_output_tail"] },
+      "estimate": { "usd": 0.06, "minutes": 5 },
+      "worker_limits": { "max_tool_calls": 20, "timeout_s": 600 }
+    },
+    {
+      "id": "s3",
+      "title": "Record the change in CHANGELOG.md",
+      "depends_on": ["s2"],
+      "instruction": "python scripts/changelog_add.py --section Fixed --entry \"parse_duration now raises ValueError on invalid input instead of crashing\"",
+      "scope": { "allow": ["CHANGELOG.md"], "max_changed_files": 1, "max_diff_lines": 4 },
+      "acceptance": [
+        { "id": "entry-present", "kind": "command", "run": "rg -q 'parse_duration now raises ValueError' CHANGELOG.md" }
+      ],
+      "lanes": ["script"],
+      "escalation": { "policy": "ladder", "within_lane": [], "after_last_lane": "human" },
+      "estimate": { "usd": 0, "minutes": 0.1 }
+    }
+  ],
+  "notes": [
+    "s2 is not a decision point: nothing after it depends on how the validation is implemented.",
+    "The goal clause 'cover the new behaviour with tests' is covered by the planner shipping tests/test_duration_validation.py in s2's acceptance, not by a worker writing tests; the human reviewer should confirm those tests reflect the intent.",
+    "If s2 escalates to expensive, check whether the s1 bundle was accurate before blaming the cheap worker."
+  ]
+}

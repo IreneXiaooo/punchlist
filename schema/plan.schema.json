@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/punchlist/schema/plan.schema.json",
+  "title": "punchlist plan",
+  "description": "Written by the planner (expensive tier), read by the runner. A plan is a spec, not a log: runtime state lives in state.json and spend in ledger.jsonl. Every step carries executable acceptance checks, and every instruction is written for the cheapest lane that might run it. Checks prove that the checks pass; whether the goal is met is a separate acceptance decision (see task.acceptance_policy).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "task", "steps"],
+  "properties": {
+    "version": { "const": "0.2" },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "goal"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$",
+          "description": "Directory name under .punchlist/."
+        },
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The user's goal, verbatim. The only requirement statement the planner did not write itself, so checks cite it (see check.covers) and it is re-read on every planner call."
+        },
+        "repo": { "type": "string", "default": ".", "description": "Repository root the plan applies to." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "planner": { "$ref": "#/$defs/model_ref" },
+        "acceptance_policy": { "$ref": "#/$defs/acceptance_policy" }
+      }
+    },
+    "budget": { "$ref": "#/$defs/budget" },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Planner notes for the human reader. Never shown to workers."
+    }
+  },
+  "$defs": {
+    "lane": { "enum": ["script", "cheap", "mid", "expensive"] },
+    "model_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime"],
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "description": "Adapter name, e.g. claude-code, openai-compatible, script. The plan names tiers, not models; this field is informational."
+        },
+        "model": { "type": "string" },
+        "effort": { "enum": ["low", "medium", "high"] }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limits": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["unit", "max"],
+            "properties": {
+              "unit": {
+                "enum": ["usd", "quota_fraction", "tokens"],
+                "description": "usd: metered API spend. quota_fraction: share (0-1) of a subscription window, the unit that matters when the expensive tier is a subscription. tokens: raw token count."
+              },
+              "lane": { "$ref": "#/$defs/lane", "description": "Limit applies to this lane only. Omit for the whole task." },
+              "max": { "type": "number", "minimum": 0 },
+              "reserve": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Part of max held back for final verification and replans. Ordinary steps may not spend into it."
+              }
+            }
+          },
+          "description": "Each limit is a request. The budget gate compares it with observations in the units it can actually measure (see config budget.sources) and treats stale or missing observations as unknown. The target 'at most 5% of the expensive tier's window per task' is {unit: quota_fraction, lane: expensive, max: 0.05}."
+        },
+        "on_unknown_cost": {
+          "enum": ["halt", "defer", "allow"],
+          "default": "halt",
+          "description": "What the gate does when an attempt's cost cannot be determined: no reported cost, no configured price, lane not marked known_zero. Unknown is never treated as zero."
+        }
+      }
+    },
+    "acceptance_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "human_review": {
+          "enum": ["required", "optional", "none"],
+          "default": "optional",
+          "description": "Whether a human must mark the task accepted after all checks pass. The planner wrote both the instructions and the checks, so a shared misunderstanding passes them; human_review and independent_review are the only defences against that."
+        },
+        "independent_review": {
+          "$ref": "#/$defs/lane",
+          "description": "If set, a final check of kind review runs on this lane with a model different from the planner's. Its cost is recorded like any attempt."
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "instruction", "scope", "acceptance", "lanes"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^s[0-9]{1,4}$" },
+        "title": { "type": "string", "maxLength": 80 },
+        "instruction": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the worker must do, written for the cheapest lane listed in `lanes`: explicit targets, bounded scope, no exploration required, no judgement calls left open. For the script lane this is the shell command to run."
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read_first": { "type": "array", "items": { "type": "string" } },
+            "bundle": {
+              "type": "string",
+              "description": "Path to a context bundle produced by an earlier scout step. Cheap workers get bounded context; they do not explore."
+            },
+            "notes": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allow"],
+          "properties": {
+            "allow": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string" },
+              "description": "Globs the worker may change. The runner computes the change set from git with untracked files included (git add -A -N, then git diff --numstat -M and --raw for modes); anything outside allow is a scope violation and fails the attempt before acceptance runs. Scope is a correctness check, not a security boundary: the sandbox is."
+            },
+            "deny": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Globs the worker may not change even if matched by allow. Paths in acceptance write_files are denied automatically."
+            },
+            "max_changed_files": { "type": "integer", "minimum": 1 },
+            "max_diff_lines": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Added plus removed lines. Exceeding it fails the attempt: a cheap worker that rewrote half the file did not understand the task."
+            }
+          }
+        },
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/check" },
+          "description": "All checks must pass. The runner decides; a model is involved only in a check of kind review."
+        },
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/lane" },
+          "description": "Tiers to try, in order. Which runtime and model a tier means is the user's config, never the planner's choice."
+        },
+        "escalation": { "$ref": "#/$defs/escalation" },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional overall cap on worker attempts; instruction rewrites are not attempts. At load time the runner computes the attempts the escalation policy implies and warns if the cap makes the last lane unreachable."
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^s[0-9]{1,4}$" }
+        },
+        "decision_point": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, the planner is re-invoked after this step passes, because its result decides what later steps should look like. Each one is an expensive call; keep them rare."
+        },
+        "report": { "$ref": "#/$defs/report_spec" },
+        "estimate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usd": { "type": "number", "minimum": 0 },
+            "quota_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+            "tokens": { "type": "integer", "minimum": 0 },
+            "minutes": { "type": "number", "minimum": 0 }
+          },
+          "description": "Planner's estimate in whatever unit the step's first lane is measured in. Spending more than twice it is an anomaly the runner records and may replan on."
+        },
+        "worker_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_tool_calls": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 25,
+              "description": "Per-attempt budget of tool calls. A worker that reaches it is stopped and the attempt is classified limit_hit; if it left a checkpoint (report.status partial) the runner may start a continuation attempt with a fresh context. Contexts are never compacted in place."
+            },
+            "timeout_s": { "type": "integer", "minimum": 1, "default": 900 },
+            "allow_continuation": {
+              "type": "boolean",
+              "default": true,
+              "description": "Permit continuation attempts from a partial checkpoint. Set false for steps that must complete in one go."
+            },
+            "max_continuations": { "type": "integer", "minimum": 0, "default": 2 },
+            "loop_detection": {
+              "type": "boolean",
+              "default": true,
+              "description": "Stop the worker when it repeats the same command or edit three times; classified limit_hit."
+            }
+          }
+        }
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "enum": ["ladder", "upgrade_first", "adaptive"],
+          "default": "ladder",
+          "description": "ladder: try within_lane rungs on the current lane, then the next lane. upgrade_first: move to the next lane on any failure. adaptive: pick the action from the failure_class using the configured rules. The three are interchangeable so they can be compared on the same task set."
+        },
+        "within_lane": {
+          "type": "array",
+          "items": { "enum": ["retry", "rewrite_instruction"] },
+          "default": ["retry", "rewrite_instruction"],
+          "description": "Rungs tried on the current lane before moving on. retry re-runs with the check output tail appended; rewrite_instruction asks the configured rewrite lane for a new instruction revision, then the same lane runs again."
+        },
+        "max_retries_per_lane": { "type": "integer", "minimum": 0, "default": 1 },
+        "max_rewrites_per_lane": { "type": "integer", "minimum": 0, "default": 1 },
+        "after_last_lane": { "enum": ["human", "fail"], "default": "human" }
+      },
+      "description": "Worked example, lanes [cheap, expensive] with defaults: cheap attempt 1 fails -> cheap retry (attempt 2) -> rewrite -> cheap attempt 3 -> expensive attempt 4 -> retry (5) -> rewrite -> attempt 6 -> human. Six attempts, two rewrites. If max_attempts is lower than six, the runner warns at load time that expensive may be unreachable."
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$" },
+        "kind": {
+          "enum": ["command", "test", "lint", "build", "typecheck", "review"],
+          "default": "command",
+          "description": "command/test/lint/build/typecheck are labels for the receipt and execute the same way. review runs reviewer_lane with questions instead of a command."
+        },
+        "covers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Phrases quoted from task.goal that this check is evidence for. Goal clauses no check covers are listed as gaps in state.acceptance and shown to the human."
+        },
+        "run": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command run at the repo root inside the sandbox after the worker has finished."
+        },
+        "write_files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string" },
+              "content": { "type": "string" }
+            }
+          },
+          "description": "Files the runner writes before running the check, overwriting whatever the worker left. This is how the planner ships acceptance tests inside the packet. These paths are denied to the worker."
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exit_code": { "type": "integer", "default": 0 },
+            "stdout_regex": { "type": "string" },
+            "stderr_regex": { "type": "string" }
+          }
+        },
+        "reviewer_lane": { "$ref": "#/$defs/lane" },
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Yes/no questions the reviewer answers from task.goal and the diff only. All must be yes. This is the one place a model's judgement acts as a check; it is optional and its cost is recorded."
+        },
+        "timeout_s": { "type": "integer", "minimum": 1, "default": 300 },
+        "tail_lines": { "type": "integer", "minimum": 1, "default": 40 }
+      },
+      "if": { "properties": { "kind": { "const": "review" } }, "required": ["kind"] },
+      "then": { "required": ["reviewer_lane", "questions"] },
+      "else": { "required": ["run"] }
+    },
+    "report_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_summary_chars": { "type": "integer", "minimum": 50, "default": 600 },
+        "evidence": {
+          "type": "array",
+          "items": { "enum": ["changed_files", "test_output_tail", "snippets", "commands_run"] },
+          "default": ["changed_files", "test_output_tail"]
+        }
+      },
+      "description": "What the worker must hand back. Evidence, not conclusions: the summary says what was done; the runner decides whether it passed."
+    }
+  }
+}

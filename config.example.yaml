@@ -1,0 +1,101 @@
+# DESIGN EXAMPLE ONLY: no runner or adapters are implemented yet.
+# punchlist config — copy to .punchlist/config.yaml (project) or ~/.config/punchlist/config.yaml (user).
+# The plan names tiers; this file says what each tier means. Model names belong here, never in code.
+version: "0.2"
+
+planner:                       # expensive tier: writes plan.json and the acceptance checks;
+  runtime: claude-code         #   re-invoked only at decision points, anomalies and escalations
+  model: ""                    # empty = the runtime's default
+  effort: high
+
+lanes:
+  script:
+    runtime: script            # no model: step.instruction is the shell command
+    cost: known_zero
+  cheap:
+    runtime: openai-compatible # v0.1 plans this one worker adapter plus script; qwen-code / opencode come later
+    model: qwen3-coder-plus    # example only; any OpenAI-compatible coder works, including local vLLM / Ollama
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    cost: configured_price     # reported | configured_price | known_zero  (there is no silent default)
+    price_usd_per_mtok:        # null = unknown. With budget.on_unknown_cost: halt, the gate refuses to run this lane
+      input: null              #   until you fill these in from your provider's price list.
+      output: null
+      cache_read: null
+  # mid:                       # optional third tier (v0.2+): rewrites instructions, reviews, first escalation stop
+  #   runtime: openai-compatible
+  #   model: ""
+  #   cost: configured_price
+  expensive:
+    runtime: claude-code
+    cost: quota                # measured as a share of a subscription window, see budget.sources.expensive
+
+rewrite_instruction_with: expensive   # with two tiers the planner tier rewrites; set to mid when you add one
+
+fast_path:                     # skip planning for small tasks; a plan costs expensive-tier quota too
+  enabled: false
+  triage: rules                # rules | cheap-model  (rules: the heuristics below; cheap-model: ask the cheap lane yes/no)
+  when:
+    max_files_hint: 2          # task text names at most this many files/functions
+    no_new_dependencies: true
+  lane: cheap
+  acceptance:                  # generic checks used when there is no plan
+    - { id: existing-tests, kind: test, run: "pytest -q -x --tb=short" }
+    - { id: lint, kind: lint, run: "ruff check ." }
+  on_failure: plan             # plan | human  — fall back to the full planner after one failed direct attempt
+
+budget:
+  gate: quotapilot              # Planned quota-aware gate; not implemented. usd | quotapilot | none.  quotapilot: an external gate that implements
+                               #   may_start(step, lane, estimate) -> allow | defer(until) | downgrade(lane) | halt
+  targets:                     # defaults merged into every plan's budget.limits
+    - { unit: quota_fraction, lane: expensive, max: 0.05, reserve: 0.01 }
+    - { unit: usd, max: 5.00 }
+  on_unknown_cost: halt        # halt | defer | allow.  Unknown is never zero.
+  sources:
+    expensive:
+      kind: claude-code-usage  # claude-code-usage | claude-code-logs | api-headers | manual
+      windows: [5h, 7d]        # windows the source reports; the gate enforces the target on each
+      refresh_s: 60
+      stale_after_s: 600       # an older observation counts as unknown
+  policy:                      # required for the first runnable budget milestone
+    review_only_at: 0.70       # of the tightest target: expensive tier only reviews, rewrite lane edits plans
+    halt_at: 0.90              # stop, write progress.md, wait for a human
+
+escalation:
+  policy: ladder               # ladder | upgrade_first | adaptive — interchangeable so they can be benchmarked
+  adaptive_rules:              # failure_class -> actions, used when policy: adaptive
+    scope_violation: [rewrite_instruction]
+    check_failed: [retry, rewrite_instruction, next_lane]
+    build_failed: [retry, next_lane]
+    blocked_missing_info: [rewrite_instruction]
+    limit_hit: [continue, next_lane]
+    env_error: [human]
+    flaky_suspected: [retry]
+    unknown: [retry, next_lane]
+
+worker_limits:
+  max_tool_calls: 25           # per attempt; reaching it ends the attempt (limit_hit); a partial checkpoint may continue in a fresh context
+  timeout_s: 900
+  allow_continuation: true
+  max_continuations: 2
+  loop_detection: true
+
+sandbox:
+  mode: container              # container (default) | os (bubblewrap / seatbelt) | confirm-only
+                               # confirm-only is NOT a security boundary: a worker allowed to run python or node can do anything.
+  mounts: [repo]               # workers see only the repository
+  network: none                # per lane override possible, e.g. for a local model server
+  confirm_destructive: true    # rm -rf, git push --force, migrations — applies in every mode
+  allow_commands: [git, python, pytest, ruff, npm, node, pnpm, make, rg, cat, ls, sed, test]
+                               # UX layer: anything else prompts. It does not replace the sandbox.
+
+verifiers:
+  test_command: "pytest -q -x --tb=short"
+  impacted_only: false         # v0.2: run only tests related to changed files
+  output_tail_lines: 40
+  change_set: explicit-base-diff  # Planned: compare with recorded attempt base; see docs/protocol.md
+  flaky_recheck: true          # a failed check is re-run once with no changes; a pass marks flaky_suspected
+
+report:
+  max_summary_chars: 600
+  evidence_default: [changed_files, test_output_tail]

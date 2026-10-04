@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/punchlist/schema/report.schema.json",
+  "title": "punchlist worker report",
+  "description": "What a worker hands back after one attempt at one step. Adapters translate each runtime's native output into this shape. A report is evidence for the runner and the planner; it never decides pass or fail, and its cost fields never default to zero.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["step_id", "attempt", "lane", "status", "stop_reason", "summary", "usage"],
+  "properties": {
+    "step_id": { "type": "string", "pattern": "^s[0-9]{1,4}$" },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "lane": { "enum": ["script", "cheap", "mid", "expensive"] },
+    "runtime": { "type": "string" },
+    "model": { "type": "string" },
+    "status": {
+      "enum": ["done", "partial", "blocked", "failed"],
+      "description": "done: the worker believes it finished (acceptance will tell). partial: it stopped before finishing but left a usable checkpoint; `checkpoint` is required and the runner may start a continuation attempt. blocked: it needs something it cannot get; `questions` is required. failed: it gave up or was stopped by a limit with nothing to hand on."
+    },
+    "stop_reason": {
+      "enum": ["completed", "tool_call_limit", "timeout", "loop_detected", "runtime_error", "interrupted"],
+      "description": "Why the worker process ended, as observed by the adapter, independent of what the worker claims."
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "What was done, in the worker's words, within the step's max_summary_chars. Not an assessment of correctness."
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["done", "remaining"],
+      "properties": {
+        "done": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+        "remaining": { "type": "array", "minItems": 1, "items": { "type": "string", "maxLength": 300 } },
+        "resume_hint": { "type": "string", "maxLength": 1000 }
+      },
+      "description": "Handoff for a continuation attempt, which starts with a fresh context, the step packet, this checkpoint and the current diff. The alternative to compacting a long-running worker's context in place."
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "change"],
+        "properties": {
+          "path": { "type": "string" },
+          "change": { "enum": ["added", "modified", "deleted", "renamed", "mode_changed"] },
+          "from_path": { "type": "string", "description": "For renamed." },
+          "symlink": { "type": "boolean" },
+          "lines_added": { "type": "integer", "minimum": 0 },
+          "lines_removed": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "description": "Computed by the adapter from git, never from the model: run `git add -A -N` first so untracked files appear, then `git diff --numstat -M -z` for counts and renames and `git diff --raw` for symlinks and mode changes. Plain `git diff --numstat` misses untracked new files."
+    },
+    "commands_run": { "type": "array", "items": { "type": "string" } },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "text"],
+        "properties": {
+          "kind": { "enum": ["snippet", "test_output", "command_output", "note"] },
+          "path": { "type": "string" },
+          "line_start": { "type": "integer", "minimum": 1 },
+          "line_end": { "type": "integer", "minimum": 1 },
+          "text": { "type": "string", "maxLength": 4000 }
+        }
+      },
+      "description": "Raw material the planner can look at without re-reading the repo. Bounded on purpose."
+    },
+    "questions": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 500 },
+      "description": "Required when status is blocked. Each should be answerable in one line; a human answer written in progress.md unblocks the step on resume."
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_s", "cost"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_tokens": { "type": "integer", "minimum": 0 },
+        "duration_s": { "type": "number", "minimum": 0 },
+        "tool_calls": { "type": "integer", "minimum": 0 },
+        "cost": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["basis"],
+          "properties": {
+            "basis": {
+              "enum": ["reported", "configured_price", "known_zero", "unknown"],
+              "description": "reported: the runtime stated the cost. configured_price: computed from tokens and the lane's configured prices. known_zero: the lane is declared free (local model, script). unknown: none of the above; the budget gate never treats this as zero."
+            },
+            "usd": { "type": "number", "minimum": 0 },
+            "quota_fraction": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "For subscription-backed lanes: the share of the window this attempt consumed, as observed by the configured quota source (difference of two observations)."
+            },
+            "source": { "type": "string", "description": "Which source produced the number, e.g. claude-code-usage, api-headers, price-table." }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "status": { "const": "blocked" } } }, "then": { "required": ["questions"] } },
+    { "if": { "properties": { "status": { "const": "partial" } } }, "then": { "required": ["checkpoint"] } },
+    {
+      "if": { "properties": { "usage": { "properties": { "cost": { "properties": { "basis": { "enum": ["reported", "configured_price"] } } } } } } },
+      "then": { "properties": { "usage": { "properties": { "cost": { "anyOf": [ { "required": ["usd"] }, { "required": ["quota_fraction"] } ] } } } } }
+    }
+  ]
+}

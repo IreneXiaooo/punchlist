@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/punchlist/schema/state.schema.json",
+  "title": "punchlist state",
+  "description": "Runtime record written only by the runner. plan.json says what should happen; state.json says what did. Recovery: every attempt runs on the task branch from a recorded base commit and is committed with its step id, and spend is appended to ledger.jsonl before state.json is rewritten, so a lost or corrupt state.json can be rebuilt from the branch and the ledger. Re-running a plan without state is NOT free: it re-executes steps and re-spends budget. Use `punchlist resume`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "plan_hash", "updated_at", "git", "budget", "acceptance", "steps", "ledger"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "plan_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Hash of the plan.json this state belongs to. If the plan changes without a matching replan record, the runner stops."
+    },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_commit", "branch"],
+      "properties": {
+        "base_commit": { "type": "string", "pattern": "^[a-f0-9]{7,64}$", "description": "Commit the task started from. Every attempt is diffed against the previous passed attempt's commit, or this." },
+        "branch": { "type": "string", "description": "Task branch, e.g. punchlist/t-0001. Attempt commits are prefixed with the step id and attempt number." },
+        "worktree": { "type": "string" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "spent"],
+      "properties": {
+        "mode": {
+          "enum": ["normal", "review_only", "halted", "deferred"],
+          "description": "normal below the policy's review_only_at. review_only: the expensive tier only reviews and the rewrite lane edits plans. deferred: the gate is waiting for a quota window to reset (see wait_until). halted: nothing runs until a human resumes."
+        },
+        "wait_until": { "type": "string", "format": "date-time" },
+        "spent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["usd", "usd_basis", "unknown_cost_attempts"],
+          "properties": {
+            "usd": { "type": "number", "minimum": 0 },
+            "usd_basis": { "enum": ["exact", "estimated", "incomplete"], "description": "incomplete when any attempt had unknown cost; the number is then a lower bound." },
+            "unknown_cost_attempts": { "type": "integer", "minimum": 0 },
+            "quota_fraction_by_lane": {
+              "type": "object",
+              "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 },
+              "description": "Share of each subscription-backed lane's window consumed by this task so far, from observations."
+            }
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["lane", "unit", "observed_at", "source", "confidence"],
+            "properties": {
+              "lane": { "enum": ["script", "cheap", "mid", "expensive"] },
+              "unit": { "enum": ["usd", "quota_fraction", "tokens"] },
+              "used": { "type": "number", "minimum": 0, "description": "Window usage at observation time, in `unit`." },
+              "baseline": { "type": "number", "minimum": 0, "description": "Usage when the task started; task consumption is used minus baseline, corrected for window resets." },
+              "window": { "type": "string", "description": "Window identifier, e.g. 5h, 7d." },
+              "window_reset_at": { "type": "string", "format": "date-time" },
+              "observed_at": { "type": "string", "format": "date-time" },
+              "source": { "type": "string" },
+              "confidence": { "enum": ["measured", "estimated", "stale"], "description": "stale observations are treated as unknown by the gate." }
+            }
+          },
+          "description": "Most recent observation per lane and unit. Older ones live in ledger.jsonl."
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["pending", "verified", "accepted", "rejected"],
+          "description": "verified: every check of every step passed. accepted: a human, or the independent review the policy asked for, confirmed the goal is met. The receipt says which."
+        },
+        "accepted_by": { "enum": ["human", "independent_review"] },
+        "accepted_at": { "type": "string", "format": "date-time" },
+        "gaps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Clauses of task.goal that no check's `covers` cites. Shown to the human before acceptance."
+        }
+      }
+    },
+    "steps": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/step_state" },
+      "description": "Keyed by step id."
+    },
+    "ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["by_lane"],
+      "properties": {
+        "by_lane": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/lane_totals" }
+        }
+      },
+      "description": "Derived summary. The authoritative record is ledger.jsonl, one line per attempt, appended before anything else is written."
+    },
+    "replans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "reason", "plan_hash_before", "plan_hash_after"],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "after_step": { "type": "string" },
+          "reason": { "enum": ["decision_point", "anomaly", "escalation", "human", "fast_path_failed"] },
+          "plan_hash_before": { "type": "string" },
+          "plan_hash_after": { "type": "string" },
+          "summary": { "type": "string", "maxLength": 1000 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "lane_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempts": { "type": "integer", "minimum": 0 },
+        "rewrites": { "type": "integer", "minimum": 0, "description": "Instruction rewrites this lane performed (as the rewrite lane), with their cost included in usd/tokens." },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "usd": { "type": "number", "minimum": 0 },
+        "quota_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "unknown_cost_attempts": { "type": "integer", "minimum": 0 },
+        "passed_first_try": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Steps this lane passed on its first attempt. The most useful number for deciding which kinds of step a tier can own."
+        }
+      }
+    },
+    "step_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "attempts"],
+      "properties": {
+        "status": { "enum": ["pending", "ready", "running", "passed", "failed", "blocked", "escalated", "skipped"] },
+        "instruction_rev": { "type": "integer", "minimum": 0, "description": "Current instruction revision; 0 is the planner's original." },
+        "attempts": { "type": "array", "items": { "$ref": "#/$defs/attempt" } }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n", "lane", "started_at", "instruction_rev"],
+      "dependentRequired": { "ended_at": ["outcome"] },
+      "properties": {
+        "n": { "type": "integer", "minimum": 1 },
+        "lane": { "enum": ["script", "cheap", "mid", "expensive"] },
+        "runtime": { "type": "string" },
+        "model": { "type": "string" },
+        "instruction_rev": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Revision of the instruction this attempt ran. Revisions are stored at attempts/<step>/instruction.<rev>.md with the rewrite's own cost in ledger.jsonl."
+        },
+        "continuation_of": { "type": "integer", "minimum": 1, "description": "Attempt number whose partial checkpoint this attempt resumed from." },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time", "description": "Absent while the attempt is running. On resume, a running attempt with no ended_at is closed as interrupted." },
+        "report": { "type": "string", "description": "Path to this attempt's report.json." },
+        "commit": { "type": "string", "pattern": "^[a-f0-9]{7,64}$", "description": "Commit holding the attempt's result on the task branch, whether or not it passed." },
+        "scope_violations": { "type": "array", "items": { "type": "string" } },
+        "acceptance": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["check_id", "passed"],
+            "properties": {
+              "check_id": { "type": "string" },
+              "passed": { "type": "boolean" },
+              "exit_code": { "type": "integer" },
+              "duration_s": { "type": "number", "minimum": 0 },
+              "output_tail": { "type": "string" }
+            }
+          }
+        },
+        "outcome": { "enum": ["passed", "failed_acceptance", "scope_violation", "partial", "blocked", "limit_hit", "interrupted", "error"] },
+        "failure_class": {
+          "enum": ["scope_violation", "check_failed", "build_failed", "blocked_missing_info", "limit_hit", "env_error", "flaky_suspected", "unknown"],
+          "description": "Assigned by the runner from outcome, acceptance results and stop_reason. Drives the adaptive escalation policy and is the label the benchmark groups by. flaky_suspected: the same checks passed on an immediate re-run with no changes."
+        },
+        "next_action": { "enum": ["retry", "rewrite_instruction", "next_lane", "continue", "human", "none"] },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 },
+            "duration_s": { "type": "number", "minimum": 0 },
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "cost_basis": { "enum": ["reported", "configured_price", "known_zero", "unknown"] },
+            "usd": { "type": "number", "minimum": 0 },
+            "quota_fraction": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    }
+  }
+}
